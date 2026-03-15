@@ -18,7 +18,7 @@ use grammers_mtproto::transport::{self, Transport};
 use grammers_mtproto::{MsgId, authentication};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types::{self as tl, Deserializable, Identifiable, RemoteCall};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use tl::Serializable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
@@ -217,8 +217,8 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     pub async fn step(&mut self) -> Result<Vec<UpdatesLike>, ReadError> {
         self.try_fill_write();
         let write_len = self.write_buffer.len() - self.write_head;
-        trace!(
-            "reading bytes and sending up to {} bytes via network",
+        debug!(
+            "step: reading bytes and sending up to {} bytes via network",
             write_len
         );
 
@@ -227,15 +227,18 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
 
         let res = tokio::select! {
             n = reader.read(&mut self.read_buffer[self.read_tail..]) => {
+                debug!("step: read event triggered, n = {:?}", n);
                 n.map_err(ReadError::Io).and_then(|n| self.on_net_read(n))
             }
             n = writer.write(&self.write_buffer[self.write_head..]), if !self.write_buffer.is_empty() => {
+                debug!("step: write event triggered, n = {:?}", n);
                 n.map_err(ReadError::Io).map(|n| {
                     self.on_net_write(n);
                     Vec::new()
                 })
             }
             _ = sleep => {
+                debug!("step: ping timeout");
                 self.on_ping_timeout();
                 Ok(Vec::new())
             }
@@ -311,13 +314,15 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         }
 
         self.read_tail += n;
-        trace!("read {} bytes from the network", n);
-        trace!("trying to unpack buffer of {} bytes...", self.read_tail);
+        debug!("read {} bytes from the network", n);
+        debug!("trying to unpack buffer of {} bytes...", self.read_tail);
 
         // TODO the buffer might have multiple transport packets, what should happen with the
         // updates successfully read if subsequent packets fail to be deserialized properly?
         let mut updates = Vec::new();
         let mut next_offset = 0;
+        let reset_on_partial = self.transport.reset_on_partial();
+
         while next_offset != self.read_tail {
             match self
                 .transport
@@ -332,7 +337,24 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                     self.process_mtp_buffer(result, &mut updates);
                     next_offset += offset.next_offset;
                 }
-                Err(transport::Error::MissingBytes) => break,
+                Err(transport::Error::MissingBytes) => {
+                    if reset_on_partial {
+                        // For packet-based transports (e.g., MTProxy), partial data cannot
+                        // be decrypted independently - each message must be complete.
+                        //
+                        // - If next_offset == 0: We have partial data at the start, discard it
+                        // - If next_offset > 0: We successfully processed at least one message,
+                        //   and there's leftover partial data. Discard it to avoid corrupting
+                        //   the next message (MTProxy decrypts from position 0).
+                        debug!(
+                            "reset_on_partial enabled: discarding {} bytes of partial data (processed {} bytes before this)",
+                            self.read_tail - next_offset, next_offset
+                        );
+                        // Reset to indicate no partial data should be kept
+                        next_offset = self.read_tail;
+                    }
+                    break;
+                }
                 Err(err) => return Err(err.into()),
             }
         }
@@ -346,7 +368,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     /// Handle `n` more written bytes being ready to process by the transport.
     fn on_net_write(&mut self, n: usize) {
         self.write_head += n;
-        trace!(
+        debug!(
             "written {} bytes to the network ({}/{})",
             n,
             self.write_head,
@@ -354,6 +376,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         );
         assert!(self.write_head <= self.write_buffer.len());
         if self.write_head != self.write_buffer.len() {
+            debug!("write incomplete, {} bytes remaining", self.write_buffer.len() - self.write_head);
             return;
         }
 

@@ -8,6 +8,62 @@
 
 const DEFAULT_LOCALE: &str = "en";
 
+/// MTProxy configuration.
+///
+/// This struct holds the configuration needed to connect through an MTProxy server.
+///
+/// # Example
+///
+/// ```ignore
+/// use grammers_mtsender::MtProxyConfig;
+///
+/// let config = MtProxyConfig {
+///     host: "proxy.example.com".to_string(),
+///     port: 8888,
+///     secret: "dd0123456789abcdef0123456789abcdef".to_string(),
+/// };
+/// ```
+#[cfg(feature = "mtproxy")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MtProxyConfig {
+    /// MTProxy server hostname or IP address.
+    pub host: String,
+    /// MTProxy server port (typically 8888, 443, or 80).
+    pub port: u16,
+    /// MTProxy secret (16 bytes in hex or base64).
+    ///
+    /// # Formats
+    ///
+    /// - **Hex**: `"0123456789abcdef0123456789abcdef"` (32 chars = 16 bytes)
+    /// - **Hex with DD prefix**: `"dd0123456789abcdef0123456789abcdef"` (DD-Secure mode)
+    /// - **Hex with EE prefix**: `"ee0123456789abcdef0123456789abcdef"` (EE-Prefix mode)
+    /// - **Base64**: `"ASNFZ4mrze/+3LqYdlQyEA=="`
+    ///
+    /// # Prefix Modes
+    ///
+    /// - No prefix: Simple mode (16 bytes)
+    /// - `dd` prefix: DD-Secure mode with random padding (17 bytes total)
+    /// - `ee` prefix: EE-Prefix mode (17 bytes total)
+    pub secret: String,
+    /// DC ID to use for MTProxy connection (optional, defaults to session's home DC).
+    ///
+    /// Some MTProxy servers may only support specific data centers.
+    /// Common values: 1, 2, 3, 4, 5
+    pub dc_id: Option<i32>,
+}
+
+#[cfg(feature = "mtproxy")]
+impl Default for MtProxyConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8888,
+            secret: String::new(),
+            dc_id: None,
+        }
+    }
+}
+
 /// Connection parameters used whenever a new connection is initialized.
 ///
 /// After creating a [`crate::SenderPool::with_configuration`], the connection of
@@ -38,6 +94,12 @@ pub struct ConnectionParams {
     /// the host manually and selecting an IP address of your choice.
     #[cfg(feature = "proxy")]
     pub proxy_url: Option<String>,
+    /// MTProxy configuration. Requires the `mtproxy` feature to be enabled.
+    ///
+    /// When set, connections will be routed through the specified MTProxy server
+    /// instead of connecting directly to Telegram servers.
+    #[cfg(feature = "mtproxy")]
+    pub mtproxy: Option<MtProxyConfig>,
     /// Whether to connect via IPv6 instead of defaulting to IPv4.
     pub use_ipv6: bool,
     #[doc(hidden)]
@@ -72,6 +134,8 @@ impl Default for ConnectionParams {
             use_ipv6: false,
             #[cfg(feature = "proxy")]
             proxy_url: None,
+            #[cfg(feature = "mtproxy")]
+            mtproxy: None,
             __non_exhaustive: (),
         }
     }

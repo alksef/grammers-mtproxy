@@ -34,6 +34,35 @@ impl ObfuscatedCipher {
         }
     }
 
+    /// Create ObfuscatedCipher from custom keys and IVs.
+    ///
+    /// This is used by MTProxy which derives keys via SHA256(random + secret)
+    /// instead of using random bytes directly.
+    ///
+    /// # Arguments
+    /// * `encrypt_key` - 32 bytes for encryption
+    /// * `encrypt_iv` - 16 bytes for encryption IV
+    /// * `decrypt_key` - 32 bytes for decryption
+    /// * `decrypt_iv` - 16 bytes for decryption IV
+    #[allow(deprecated)] // see https://github.com/RustCrypto/block-ciphers/issues/509
+    pub fn from_parts(
+        encrypt_key: [u8; 32],
+        encrypt_iv: [u8; 16],
+        decrypt_key: [u8; 32],
+        decrypt_iv: [u8; 16],
+    ) -> Self {
+        Self {
+            rx: ctr::Ctr128BE::<aes::Aes256>::new(
+                GenericArray::from_slice(&decrypt_key),
+                GenericArray::from_slice(&decrypt_iv),
+            ),
+            tx: ctr::Ctr128BE::<aes::Aes256>::new(
+                GenericArray::from_slice(&encrypt_key),
+                GenericArray::from_slice(&encrypt_iv),
+            ),
+        }
+    }
+
     pub fn encrypt(&mut self, buffer: &mut [u8]) {
         self.tx.apply_keystream(buffer);
     }

@@ -16,6 +16,8 @@ pub enum NetStream {
     Tcp(TcpStream),
     #[cfg(feature = "proxy")]
     ProxySocks5(tokio_socks::tcp::Socks5Stream<TcpStream>),
+    #[cfg(feature = "mtproxy")]
+    MtProxy(TcpStream),
 }
 
 impl NetStream {
@@ -24,6 +26,8 @@ impl NetStream {
             Self::Tcp(stream) => stream.split(),
             #[cfg(feature = "proxy")]
             Self::ProxySocks5(stream) => stream.split(),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(stream) => stream.split(),
         }
     }
 
@@ -35,7 +39,45 @@ impl NetStream {
             ServerAddr::Proxied { address, proxy } => {
                 Self::connect_proxy_stream(address, proxy).await
             }
+            #[cfg(feature = "mtproxy")]
+            ServerAddr::MtProxy {
+                proxy_host,
+                proxy_port,
+                secret: _,
+                dc_id: _,
+            } => {
+                // Resolve hostname and connect
+                Self::connect_mtproxy_stream(proxy_host, *proxy_port).await
+            }
         }
+    }
+
+    #[cfg(feature = "mtproxy")]
+    async fn connect_mtproxy_stream(
+        host: &str,
+        port: u16,
+    ) -> Result<NetStream, std::io::Error> {
+        use tokio::net::lookup_host;
+
+        info!("connecting to MTProxy at {}:{}", host, port);
+
+        // Try to resolve the hostname
+        let addrs = lookup_host((host, port)).await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("failed to resolve MTProxy host {}: {}", host, e),
+            )
+        })?;
+
+        // Use the first resolved address
+        let addr = addrs.into_iter().next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no addresses found for MTProxy host {}", host),
+            )
+        })?;
+
+        Ok(NetStream::MtProxy(TcpStream::connect(addr).await?))
     }
 
     #[cfg(feature = "proxy")]

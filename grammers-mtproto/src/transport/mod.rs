@@ -16,7 +16,9 @@
 mod abridged;
 mod full;
 mod intermediate;
+mod mtproxy;
 mod obfuscated;
+mod randomized_intermediate;
 
 use std::{fmt, ops::Range};
 
@@ -24,7 +26,9 @@ pub use abridged::Abridged;
 pub use full::Full;
 use grammers_crypto::DequeBuffer;
 pub use intermediate::Intermediate;
+pub use mtproxy::{MtProxy, SecretMode, with_auto_transport};
 pub use obfuscated::Obfuscated;
+pub use randomized_intermediate::RandomizedIntermediate;
 
 /// The error type reported by the different transports when something is wrong.
 ///
@@ -103,6 +107,19 @@ pub trait Transport {
     /// with the data on the ranges from previous `UnpackedOffset` removed.
     /// Failing to do so will cause transports such as [`Obfuscated`] to misbehave.
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error>;
+
+    /// Whether the transport should reset the read buffer when `unpack` returns `MissingBytes`.
+    ///
+    /// - Returns `false` for streaming transports (e.g., [`Obfuscated`]), which can decrypt
+    ///   partial data as it arrives and maintain state across calls.
+    /// - Returns `true` for packet-based transports (e.g., [`MtProxy`]), where each message
+    ///   must be decrypted independently from position 0. Partial data cannot be used.
+    ///
+    /// When this returns `true`, `sender` will discard partial reads and wait for a complete
+    /// packet, rather than accumulating data across multiple `unpack` calls.
+    fn reset_on_partial(&self) -> bool {
+        false
+    }
 }
 
 /// The trait used by the obfuscated transport to get the transport tags.

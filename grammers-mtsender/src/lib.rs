@@ -30,6 +30,8 @@ mod sender;
 mod sender_pool;
 
 pub use configuration::ConnectionParams;
+#[cfg(feature = "mtproxy")]
+pub use configuration::MtProxyConfig;
 pub use errors::{InvocationError, ReadError, RpcError};
 pub use net::ServerAddr;
 pub use sender::{Sender, connect, connect_with_auth, generate_auth_key};

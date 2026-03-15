@@ -26,7 +26,45 @@ use crate::configuration::ConnectionParams;
 use crate::errors::ReadError;
 use crate::{InvocationError, Sender, ServerAddr, connect, connect_with_auth};
 
-pub(crate) type Transport = transport::Full;
+use grammers_crypto::DequeBuffer;
+use grammers_mtproto::transport::{Transport as TransportTrait, UnpackedOffset, Error as TransportError};
+
+/// Wrapper for different transport types to allow runtime selection.
+pub(crate) enum TransportWrapper {
+    /// Normal full transport for direct connections
+    Normal(transport::Full),
+    /// MTProxy transport for proxy connections
+    #[cfg(feature = "mtproxy")]
+    MtProxy(transport::MtProxy<transport::RandomizedIntermediate>),
+}
+
+impl TransportTrait for TransportWrapper {
+    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+        match self {
+            Self::Normal(t) => t.pack(buffer),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(t) => t.pack(buffer),
+        }
+    }
+
+    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, TransportError> {
+        match self {
+            Self::Normal(t) => t.unpack(buffer),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(t) => t.unpack(buffer),
+        }
+    }
+
+    fn reset_on_partial(&self) -> bool {
+        match self {
+            Self::Normal(t) => t.reset_on_partial(),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(t) => t.reset_on_partial(),
+        }
+    }
+}
+
+pub(crate) type Transport = TransportWrapper;
 
 type InvokeResponse = Vec<u8>;
 
@@ -288,16 +326,29 @@ impl SenderPoolRunner {
     async fn connect_sender(
         &mut self,
         dc_option: &DcOption,
-    ) -> Result<Sender<transport::Full, mtp::Encrypted>, InvocationError> {
-        let transport = transport::Full::new;
-
+    ) -> Result<Sender<Transport, mtp::Encrypted>, InvocationError> {
         let address = if self.connection_params.use_ipv6 {
             dc_option.ipv6.into()
         } else {
             dc_option.ipv4.into()
         };
 
-        #[cfg(feature = "proxy")]
+        #[cfg(all(feature = "proxy", feature = "mtproxy"))]
+        let addr = || {
+            if let Some(ref mtproxy) = self.connection_params.mtproxy {
+                ServerAddr::MtProxy {
+                    proxy_host: mtproxy.host.clone(),
+                    proxy_port: mtproxy.port,
+                    secret: mtproxy.secret.clone(),
+                    dc_id: mtproxy.dc_id.unwrap_or(dc_option.id),
+                }
+            } else if let Some(proxy) = self.connection_params.proxy_url.clone() {
+                ServerAddr::Proxied { address, proxy }
+            } else {
+                ServerAddr::Tcp { address }
+            }
+        };
+        #[cfg(all(feature = "proxy", not(feature = "mtproxy")))]
         let addr = || {
             if let Some(proxy) = self.connection_params.proxy_url.clone() {
                 ServerAddr::Proxied { address, proxy }
@@ -306,7 +357,19 @@ impl SenderPoolRunner {
             }
         };
         #[cfg(not(feature = "proxy"))]
-        let addr = || ServerAddr::Tcp { address };
+        let addr = || {
+            #[cfg(feature = "mtproxy")]
+            if let Some(ref mtproxy) = self.connection_params.mtproxy {
+                ServerAddr::MtProxy {
+                    proxy_host: mtproxy.host.clone(),
+                    proxy_port: mtproxy.port,
+                    secret: mtproxy.secret.clone(),
+                    dc_id: mtproxy.dc_id.unwrap_or(dc_option.id),
+                }
+            } else {
+                ServerAddr::Tcp { address }
+            }
+        };
 
         let init_connection = tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
@@ -324,16 +387,46 @@ impl SenderPoolRunner {
             },
         };
 
+        // Create transport based on server address type
+        let addr = addr();
+        log::debug!("connect_sender: creating transport for addr: {:?}", std::any::type_name_of_val(&addr));
+        let transport = match &addr {
+            #[cfg(feature = "mtproxy")]
+            ServerAddr::MtProxy { secret, dc_id, .. } => {
+                log::debug!("connect_sender: MTProxy with dc_id = {}", dc_id);
+                let inner = transport::RandomizedIntermediate::new();
+                let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
+                    .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                TransportWrapper::MtProxy(mtproxy)
+            }
+            _ => {
+                TransportWrapper::Normal(transport::Full::new())
+            }
+        };
+
         let mut sender = if let Some(auth_key) = dc_option.auth_key {
-            connect_with_auth(transport(), addr(), auth_key).await?
+            connect_with_auth(transport, addr.clone(), auth_key).await?
         } else {
-            connect(transport(), addr()).await?
+            connect(transport, addr.clone()).await?
         };
 
         let enums::Config::Config(remote_config) = match sender.invoke(&init_connection).await {
             Ok(config) => config,
             Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
-                sender = connect(transport(), addr()).await?;
+                // Recreate transport for retry
+                let transport = match &addr {
+                    #[cfg(feature = "mtproxy")]
+                    ServerAddr::MtProxy { secret, dc_id, .. } => {
+                        let inner = transport::RandomizedIntermediate::new();
+                        let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
+                            .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                        TransportWrapper::MtProxy(mtproxy)
+                    }
+                    _ => {
+                        TransportWrapper::Normal(transport::Full::new())
+                    }
+                };
+                sender = connect(transport, addr).await?;
                 sender.invoke(&init_connection).await?
             }
             Err(e) => return Err(dbg!(e).into()),

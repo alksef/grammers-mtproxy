@@ -33,9 +33,12 @@ use grammers_mtproto::transport::{Transport as TransportTrait, UnpackedOffset, E
 pub(crate) enum TransportWrapper {
     /// Normal full transport for direct connections
     Normal(transport::Full),
-    /// MTProxy transport for proxy connections
+    /// MTProxy transport with RandomizedIntermediate (DD-Secure mode)
     #[cfg(feature = "mtproxy")]
-    MtProxy(transport::MtProxy<transport::RandomizedIntermediate>),
+    MtProxyRandomized(transport::MtProxy<transport::RandomizedIntermediate>),
+    /// MTProxy transport with Abridged (Simple mode)
+    #[cfg(feature = "mtproxy")]
+    MtProxyAbridged(transport::MtProxy<transport::Abridged>),
 }
 
 impl TransportTrait for TransportWrapper {
@@ -43,7 +46,9 @@ impl TransportTrait for TransportWrapper {
         match self {
             Self::Normal(t) => t.pack(buffer),
             #[cfg(feature = "mtproxy")]
-            Self::MtProxy(t) => t.pack(buffer),
+            Self::MtProxyRandomized(t) => t.pack(buffer),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyAbridged(t) => t.pack(buffer),
         }
     }
 
@@ -51,7 +56,9 @@ impl TransportTrait for TransportWrapper {
         match self {
             Self::Normal(t) => t.unpack(buffer),
             #[cfg(feature = "mtproxy")]
-            Self::MtProxy(t) => t.unpack(buffer),
+            Self::MtProxyRandomized(t) => t.unpack(buffer),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyAbridged(t) => t.unpack(buffer),
         }
     }
 
@@ -59,7 +66,9 @@ impl TransportTrait for TransportWrapper {
         match self {
             Self::Normal(t) => t.reset_on_partial(),
             #[cfg(feature = "mtproxy")]
-            Self::MtProxy(t) => t.reset_on_partial(),
+            Self::MtProxyRandomized(t) => t.reset_on_partial(),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyAbridged(t) => t.reset_on_partial(),
         }
     }
 }
@@ -333,44 +342,6 @@ impl SenderPoolRunner {
             dc_option.ipv4.into()
         };
 
-        #[cfg(all(feature = "proxy", feature = "mtproxy"))]
-        let addr = || {
-            if let Some(ref mtproxy) = self.connection_params.mtproxy {
-                ServerAddr::MtProxy {
-                    proxy_host: mtproxy.host.clone(),
-                    proxy_port: mtproxy.port,
-                    secret: mtproxy.secret.clone(),
-                    dc_id: mtproxy.dc_id.unwrap_or(dc_option.id),
-                }
-            } else if let Some(proxy) = self.connection_params.proxy_url.clone() {
-                ServerAddr::Proxied { address, proxy }
-            } else {
-                ServerAddr::Tcp { address }
-            }
-        };
-        #[cfg(all(feature = "proxy", not(feature = "mtproxy")))]
-        let addr = || {
-            if let Some(proxy) = self.connection_params.proxy_url.clone() {
-                ServerAddr::Proxied { address, proxy }
-            } else {
-                ServerAddr::Tcp { address }
-            }
-        };
-        #[cfg(not(feature = "proxy"))]
-        let addr = || {
-            #[cfg(feature = "mtproxy")]
-            if let Some(ref mtproxy) = self.connection_params.mtproxy {
-                ServerAddr::MtProxy {
-                    proxy_host: mtproxy.host.clone(),
-                    proxy_port: mtproxy.port,
-                    secret: mtproxy.secret.clone(),
-                    dc_id: mtproxy.dc_id.unwrap_or(dc_option.id),
-                }
-            } else {
-                ServerAddr::Tcp { address }
-            }
-        };
-
         let init_connection = tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
             query: tl::functions::InitConnection {
@@ -388,20 +359,75 @@ impl SenderPoolRunner {
         };
 
         // Create transport based on server address type
-        let addr = addr();
-        log::debug!("connect_sender: creating transport for addr: {:?}", std::any::type_name_of_val(&addr));
-        let transport = match &addr {
-            #[cfg(feature = "mtproxy")]
-            ServerAddr::MtProxy { secret, dc_id, .. } => {
-                log::debug!("connect_sender: MTProxy with dc_id = {}", dc_id);
-                let inner = transport::RandomizedIntermediate::new();
-                let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
-                    .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-                TransportWrapper::MtProxy(mtproxy)
-            }
-            _ => {
-                TransportWrapper::Normal(transport::Full::new())
-            }
+        log::debug!("connect_sender: creating transport");
+        let (transport, addr) = {
+            #[cfg(all(feature = "proxy", feature = "mtproxy"))]
+            let addr = if let Some(ref mtproxy) = self.connection_params.mtproxy {
+                ServerAddr::MtProxy {
+                    proxy_host: mtproxy.host.clone(),
+                    proxy_port: mtproxy.port,
+                    secret: mtproxy.secret.clone(),
+                    dc_id: mtproxy.dc_id.unwrap_or(dc_option.id),
+                }
+            } else if let Some(proxy) = self.connection_params.proxy_url.clone() {
+                ServerAddr::Proxied { address, proxy }
+            } else {
+                ServerAddr::Tcp { address }
+            };
+
+            #[cfg(all(feature = "proxy", not(feature = "mtproxy")))]
+            let addr = if let Some(proxy) = self.connection_params.proxy_url.clone() {
+                ServerAddr::Proxied { address, proxy }
+            } else {
+                ServerAddr::Tcp { address }
+            };
+
+            #[cfg(not(feature = "proxy"))]
+            let addr = {
+                #[cfg(feature = "mtproxy")]
+                let addr = if let Some(ref mtproxy) = self.connection_params.mtproxy {
+                    ServerAddr::MtProxy {
+                        proxy_host: mtproxy.host.clone(),
+                        proxy_port: mtproxy.port,
+                        secret: mtproxy.secret.clone(),
+                        dc_id: mtproxy.dc_id.unwrap_or(dc_option.id),
+                    }
+                } else {
+                    ServerAddr::Tcp { address }
+                };
+                #[cfg(not(feature = "mtproxy"))]
+                let addr = ServerAddr::Tcp { address };
+                addr
+            };
+
+            let transport = match &addr {
+                #[cfg(feature = "mtproxy")]
+                ServerAddr::MtProxy { secret, dc_id, .. } => {
+                    log::debug!("connect_sender: MTProxy with dc_id = {}, secret prefix = {:?}", dc_id, &secret.get(..2));
+                    let secret_lower = secret.to_lowercase();
+                    if secret_lower.starts_with("dd") {
+                        log::debug!("connect_sender: Using RandomizedIntermediate (DD-Secure mode)");
+                        let inner = transport::RandomizedIntermediate::new();
+                        let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
+                            .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                        TransportWrapper::MtProxyRandomized(mtproxy)
+                    } else if secret_lower.starts_with("ee") {
+                        log::debug!("connect_sender: EE-FakeTLS mode - using plain Intermediate transport");
+                        TransportWrapper::Normal(transport::Full::new())
+                    } else {
+                        log::debug!("connect_sender: Using Abridged (Simple mode)");
+                        let inner = transport::Abridged::new();
+                        let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
+                            .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                        TransportWrapper::MtProxyAbridged(mtproxy)
+                    }
+                }
+                _ => {
+                    TransportWrapper::Normal(transport::Full::new())
+                }
+            };
+
+            (transport, addr)
         };
 
         let mut sender = if let Some(auth_key) = dc_option.auth_key {
@@ -417,16 +443,31 @@ impl SenderPoolRunner {
                 let transport = match &addr {
                     #[cfg(feature = "mtproxy")]
                     ServerAddr::MtProxy { secret, dc_id, .. } => {
-                        let inner = transport::RandomizedIntermediate::new();
-                        let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
-                            .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-                        TransportWrapper::MtProxy(mtproxy)
+                        log::debug!("connect_sender: MTProxy retry with dc_id = {}, secret prefix = {:?}", dc_id, &secret.get(..2));
+                        // Choose inner transport based on secret prefix
+                        let secret_lower = secret.to_lowercase();
+                        if secret_lower.starts_with("dd") {
+                            log::debug!("connect_sender: Retry using RandomizedIntermediate (DD-Secure mode)");
+                            let inner = transport::RandomizedIntermediate::new();
+                            let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
+                                .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                            TransportWrapper::MtProxyRandomized(mtproxy)
+                        } else if secret_lower.starts_with("ee") {
+                            log::debug!("connect_sender: EE-FakeTLS mode retry - using plain Intermediate transport");
+                            TransportWrapper::Normal(transport::Full::new())
+                        } else {
+                            log::debug!("connect_sender: Retry using Abridged (Simple mode)");
+                            let inner = transport::Abridged::new();
+                            let mtproxy = transport::MtProxy::new(inner, secret, *dc_id)
+                                .map_err(|e| InvocationError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                            TransportWrapper::MtProxyAbridged(mtproxy)
+                        }
                     }
                     _ => {
                         TransportWrapper::Normal(transport::Full::new())
                     }
                 };
-                sender = connect(transport, addr).await?;
+                sender = connect(transport, addr.clone()).await?;
                 sender.invoke(&init_connection).await?
             }
             Err(e) => return Err(dbg!(e).into()),

@@ -141,7 +141,8 @@ async fn async_main(api_id: i32, api_hash: String, mtproxy_host: String, mtproxy
         println!("\nAuthorization required. Signing in...");
 
         let phone = prompt("Enter your phone number (international format, e.g. +1234567890): ")?;
-        let token = client.request_login_code(&phone.trim(), &api_hash).await?;
+        let phone_sanitized = phone.trim().chars().filter(|c| c.is_ascii_digit() || *c == '+').collect::<String>();
+        let token = client.request_login_code(&phone_sanitized, &api_hash).await?;
         let code = prompt("Enter the code you received: ")?;
         let signed_in = client.sign_in(&token, code.trim()).await;
 

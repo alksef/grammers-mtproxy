@@ -35,7 +35,7 @@ pub(crate) enum TransportWrapper {
     Normal(transport::Full),
     /// Intermediate transport for FakeTLS connections
     #[cfg(feature = "mtproxy")]
-    NormalIntermediate(transport::Intermediate),
+    NormalIntermediate(transport::RandomizedIntermediate),
     /// MTProxy transport with RandomizedIntermediate (DD-Secure mode)
     #[cfg(feature = "mtproxy")]
     MtProxyRandomized(transport::MtProxy<transport::RandomizedIntermediate>),
@@ -415,8 +415,8 @@ impl SenderPoolRunner {
                     log::debug!("connect_sender: MTProxy with dc_id = {}", dc_id);
                     match transport::parse_secret(secret) {
                         Ok(transport::ProxySecret::Faketls { .. }) => {
-                            log::debug!("connect_sender: FakeTLS mode - using plain Intermediate transport");
-                            TransportWrapper::NormalIntermediate(transport::Intermediate::new())
+                            log::debug!("connect_sender: FakeTLS mode - using plain RandomizedIntermediate transport");
+                            TransportWrapper::NormalIntermediate(transport::RandomizedIntermediate::new())
                         }
                         Ok(transport::ProxySecret::Secured(_)) => {
                             log::debug!("connect_sender: DD-Secure mode - using RandomizedIntermediate");
@@ -462,8 +462,8 @@ impl SenderPoolRunner {
                         log::debug!("connect_sender: MTProxy retry with dc_id = {}", dc_id);
                         match transport::parse_secret(secret) {
                             Ok(transport::ProxySecret::Faketls { .. }) => {
-                                log::debug!("connect_sender: FakeTLS retry - using plain Intermediate");
-                                TransportWrapper::NormalIntermediate(transport::Intermediate::new())
+                                log::debug!("connect_sender: FakeTLS retry - using plain RandomizedIntermediate");
+                                TransportWrapper::NormalIntermediate(transport::RandomizedIntermediate::new())
                             }
                             Ok(transport::ProxySecret::Secured(_)) => {
                                 log::debug!("connect_sender: DD-Secure retry");

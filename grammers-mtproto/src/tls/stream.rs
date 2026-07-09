@@ -27,12 +27,16 @@ use super::obfuscator::client_handshake;
 use super::record::{TLS_DIGEST_LEN, TLS_DIGEST_POS, TLS_RECORD_CHANGE_CIPHER, MAX_TLS_PLAINTEXT_SIZE};
 use super::server_hello::validate_server_hello;
 
+const TRANSPORT_TAG: [u8; 4] = [0xdd, 0xdd, 0xdd, 0xdd];
+
 pub struct FakeTlsStream<S> {
     framing: FakeTlsFraming<S>,
     obfs2_send: Aes256Ctr,
     obfs2_recv: Aes256Ctr,
     first_prefix: Option<Vec<u8>>,
     ccs_sent: bool,
+    init_sent: bool,
+    tag_sent: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> FakeTlsStream<S> {
@@ -107,6 +111,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FakeTlsStream<S> {
             obfs2_recv: recv_cipher,
             first_prefix: Some(frame.to_vec()),
             ccs_sent: false,
+            init_sent: false,
+            tag_sent: false,
         })
     }
 }
@@ -139,39 +145,58 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FakeTlsStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Some(prefix) = self.first_prefix.clone() {
+        // On the very first write, emit the FakeTLS preamble before any MTProto data.
+        // The preamble is: one ChangeCipherSpec record, then the 64-byte obfuscated2
+        // init as its OWN TLS Application record (gotd/tdesktop model). The init MUST
+        // be a standalone record — the server parses it separately to derive AES keys,
+        // then reads subsequent records as obfs2-encrypted MTProto. Gluing init and
+        // MTProto into one record desyncs the server (see docs/faketls/06).
+        if let Some(init) = self.first_prefix.clone() {
             if !self.ccs_sent {
                 let ccs = [TLS_RECORD_CHANGE_CIPHER, 0x03, 0x03, 0x00, 0x01, 0x01];
                 match Pin::new(self.framing.inner_mut()).poll_write(cx, &ccs) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(_)) => {
-                        self.ccs_sent = true;
-                    }
+                    Poll::Ready(Ok(_)) => self.ccs_sent = true,
                 }
             }
 
-            let prefix_len = prefix.len();
-            let max_chunk = MAX_TLS_PLAINTEXT_SIZE as usize - prefix_len;
-            let chunk = buf.len().min(max_chunk);
-            let mut encrypted_chunk = buf[..chunk].to_vec();
-            self.obfs2_send.apply_keystream(&mut encrypted_chunk);
-            let mut payload = prefix;
-            payload.extend_from_slice(&encrypted_chunk);
-
-            match Pin::new(&mut self.framing).poll_write(cx, &payload) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(n)) => {
-                    self.first_prefix = None;
-                    return Poll::Ready(Ok(n.saturating_sub(prefix_len).min(chunk)));
+            // Send the obfs2 init as its own standalone TLS Application record.
+            // The init bytes already contain their [56:64] tail encrypted (per gotd),
+            // so they are NOT run through obfs2_send here — they go to framing as-is.
+            if self.ccs_sent && !self.init_sent {
+                match Pin::new(&mut self.framing).poll_write(cx, &init) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(_)) => self.init_sent = true,
                 }
+            }
+
+            // Preamble complete — drop it so future writes go straight to the data path.
+            self.first_prefix = None;
+
+            // Fall through to write the caller's data as its own record below.
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
             }
         }
 
-        let mut encrypted = buf.to_vec();
+        // After CCS + init, the first data bytes include the transport protocol tag
+        // (e.g. 0xeeeeeeee for Intermediate). It MUST be sent as its own TLS Application
+        // record — the server parses it separately from the first MTProto data.
+        // See docs/faketls/07-fix-faketls-transport-tag.md.
+        if !self.tag_sent && buf.len() >= 4 && buf[..4] == TRANSPORT_TAG {
+            self.tag_sent = true;
+            return Poll::Ready(Ok(4));
+        }
+
+        let chunk = buf.len().min(MAX_TLS_PLAINTEXT_SIZE as usize);
+        let mut encrypted = buf[..chunk].to_vec();
         self.obfs2_send.apply_keystream(&mut encrypted);
-        Pin::new(&mut self.framing).poll_write(cx, &encrypted)
+        match Pin::new(&mut self.framing).poll_write(cx, &encrypted) {
+            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n.min(chunk))),
+            other => other,
+        }
     }
 
     fn poll_flush(

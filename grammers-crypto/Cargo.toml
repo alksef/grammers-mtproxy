@@ -16,7 +16,7 @@ edition = "2024"
 [dependencies]
 aes = "0.8.4"
 getrandom = "0.4.1"
-glass_pumpkin = "1.10.0"
+glass_pumpkin = "2.0.0-rc0"
 hmac = "0.12.1"
 num-bigint = "0.4.6"
 pbkdf2 = "0.12.2"

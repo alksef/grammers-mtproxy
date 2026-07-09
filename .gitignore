@@ -8,3 +8,6 @@ testbed.rs
 
 # scraped docs
 *.json
+
+# FakeTLS wire dumps (contain client traffic metadata — not for public commit)
+docs/faketls/dumps/

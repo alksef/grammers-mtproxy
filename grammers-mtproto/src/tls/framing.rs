@@ -30,6 +30,7 @@ const HEADER_SIZE: usize = 5;
 enum ReadState {
     Header { offset: usize },
     Payload { length: usize, offset: usize },
+    Discard { length: usize, offset: usize },
     Buffered { pos: usize, len: usize },
 }
 
@@ -71,17 +72,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FakeTlsFraming<S> {
         loop {
             match this.read_state {
                 ReadState::Header { offset } => {
-                    let mut hdr = [0u8; HEADER_SIZE];
                     if offset < HEADER_SIZE {
-                        let mut small = ReadBuf::new(&mut hdr[offset..]);
+                        let mut small = ReadBuf::new(&mut this.read_buf[offset..HEADER_SIZE]);
                         match Pin::new(&mut this.inner).poll_read(cx, &mut small) {
                             Poll::Ready(Ok(())) => {
-                                let filled = offset + small.filled().len();
+                                let read_bytes = small.filled().len();
+                                if read_bytes == 0 {
+                                    return Poll::Ready(Ok(())); // EOF
+                                }
+                                let filled = offset + read_bytes;
                                 if filled < HEADER_SIZE {
                                     this.read_state = ReadState::Header { offset: filled };
-                                    return Poll::Pending;
+                                    continue;
                                 }
-                                let header = TlsRecordHeader::from_bytes(&hdr)
+                                let header = TlsRecordHeader::from_bytes(&this.read_buf[..HEADER_SIZE])
                                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                                 let record_type = header.record_type;
                                 let length = header.length as usize;
@@ -91,24 +95,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FakeTlsFraming<S> {
                                         this.read_state = ReadState::Header { offset: 0 };
                                         continue;
                                     }
-                                    // Read and discard CCS payload
-                                    let mut discard = vec![0u8; length];
-                                    let mut discard_buf = ReadBuf::new(&mut discard);
-                                    match Pin::new(&mut this.inner).poll_read(cx, &mut discard_buf) {
-                                        Poll::Ready(Ok(())) => {
-                                            if discard_buf.filled().len() < length {
-                                                this.read_state = ReadState::Payload { length, offset: discard_buf.filled().len() };
-                                                return Poll::Pending;
-                                            }
-                                            this.read_state = ReadState::Header { offset: 0 };
-                                            continue;
-                                        }
-                                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                        Poll::Pending => {
-                                            this.read_state = ReadState::Payload { length, offset: 0 };
-                                            return Poll::Pending;
-                                        }
-                                    }
+                                    this.read_state = ReadState::Discard { length, offset: 0 };
+                                    continue;
                                 }
                                 if record_type != TLS_RECORD_APPLICATION {
                                     return Poll::Ready(Err(io::Error::new(
@@ -135,10 +123,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FakeTlsFraming<S> {
                     let mut payload_buf = ReadBuf::new(&mut this.read_buf[offset..offset + to_read]);
                     match Pin::new(&mut this.inner).poll_read(cx, &mut payload_buf) {
                         Poll::Ready(Ok(())) => {
-                            let new_offset = offset + payload_buf.filled().len();
+                            let read_bytes = payload_buf.filled().len();
+                            if read_bytes == 0 {
+                                return Poll::Ready(Ok(())); // EOF
+                            }
+                            let new_offset = offset + read_bytes;
                             if new_offset < length {
                                 this.read_state = ReadState::Payload { length, offset: new_offset };
-                                return Poll::Pending;
+                                continue;
                             }
                             let to_copy = length.min(buf.remaining());
                             buf.put_slice(&this.read_buf[..to_copy]);
@@ -159,6 +151,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FakeTlsFraming<S> {
                         }
                         Poll::Pending => {
                             this.read_state = ReadState::Payload { length, offset };
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                ReadState::Discard { length, offset } => {
+                    let to_read = (length - offset).min(this.read_buf.len());
+                    let mut discard_buf = ReadBuf::new(&mut this.read_buf[..to_read]);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut discard_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let read_bytes = discard_buf.filled().len();
+                            if read_bytes == 0 {
+                                return Poll::Ready(Ok(())); // EOF
+                            }
+                            let new_offset = offset + read_bytes;
+                            if new_offset < length {
+                                this.read_state = ReadState::Discard { length, offset: new_offset };
+                                continue;
+                            }
+                            this.read_state = ReadState::Header { offset: 0 };
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            this.read_state = ReadState::Header { offset: 0 };
+                            return Poll::Ready(Err(e));
+                        }
+                        Poll::Pending => {
+                            this.read_state = ReadState::Discard { length, offset };
                             return Poll::Pending;
                         }
                     }

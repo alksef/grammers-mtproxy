@@ -55,10 +55,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mtproxy_secret = env::var("MTPROXY_SECRET")
         .unwrap_or_else(|_| "dd0123456789abcdef0123456789abcdef".to_string());
 
+    // DC ID (optional). Some MTProxy servers support only specific data centers.
+    let mtproxy_dc_id = env::var("MTPROXY_DC_ID")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok());
+
     println!("MTProxy Configuration:");
     println!("  API ID: {}", api_id);
     println!("  Proxy: {}:{}", mtproxy_host, mtproxy_port);
     println!("  Secret: {}***", &mtproxy_secret[..8]);
+    println!("  DC ID: {:?}", mtproxy_dc_id);
 
     // Load or create session
     let session = Arc::new(SqliteSession::open("mtproxy.session").await?);
@@ -70,6 +76,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             host: mtproxy_host,
             port: mtproxy_port,
             secret: mtproxy_secret,
+            dc_id: mtproxy_dc_id,
         }),
         ..Default::default()
     };

@@ -15,7 +15,7 @@ edition = "2024"
 
 [features]
 proxy = ["tokio-socks", "hickory-resolver", "url"]
-mtproxy = []
+mtproxy = ["grammers-mtproto/mtproxy"]
 
 [dependencies]
 bytes = "1.11.1"

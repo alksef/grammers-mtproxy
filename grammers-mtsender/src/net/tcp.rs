@@ -7,8 +7,8 @@
 // except according to those terms.
 
 use log::info;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-pub use tokio::net::tcp::{ReadHalf, WriteHalf};
 
 use super::ServerAddr;
 
@@ -18,17 +18,88 @@ pub enum NetStream {
     ProxySocks5(tokio_socks::tcp::Socks5Stream<TcpStream>),
     #[cfg(feature = "mtproxy")]
     MtProxy(TcpStream),
+    #[cfg(feature = "mtproxy")]
+    MtProxyFakeTls(grammers_mtproto::tls::FakeTlsStream<TcpStream>),
+}
+
+impl AsyncRead for NetStream {
+    #[allow(unused_mut)]
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "proxy")]
+            Self::ProxySocks5(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyFakeTls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for NetStream {
+    #[allow(unused_mut)]
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "proxy")]
+            Self::ProxySocks5(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyFakeTls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    #[allow(unused_mut)]
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "proxy")]
+            Self::ProxySocks5(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyFakeTls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    #[allow(unused_mut)]
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "proxy")]
+            Self::ProxySocks5(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxy(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "mtproxy")]
+            Self::MtProxyFakeTls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
 }
 
 impl NetStream {
-    pub(crate) fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
-        match self {
-            Self::Tcp(stream) => stream.split(),
-            #[cfg(feature = "proxy")]
-            Self::ProxySocks5(stream) => stream.split(),
-            #[cfg(feature = "mtproxy")]
-            Self::MtProxy(stream) => stream.split(),
-        }
+    pub(crate) fn split(
+        &mut self,
+    ) -> (
+        tokio::io::ReadHalf<&mut Self>,
+        tokio::io::WriteHalf<&mut Self>,
+    ) {
+        tokio::io::split(self)
     }
 
     pub(crate) async fn connect(addr: &ServerAddr) -> Result<Self, std::io::Error> {
@@ -43,11 +114,10 @@ impl NetStream {
             ServerAddr::MtProxy {
                 proxy_host,
                 proxy_port,
-                secret: _,
-                dc_id: _,
+                secret,
+                dc_id,
             } => {
-                // Resolve hostname and connect
-                Self::connect_mtproxy_stream(proxy_host, *proxy_port).await
+                Self::connect_mtproxy_stream(proxy_host, *proxy_port, secret, *dc_id).await
             }
         }
     }
@@ -56,12 +126,13 @@ impl NetStream {
     async fn connect_mtproxy_stream(
         host: &str,
         port: u16,
+        secret: &str,
+        dc_id: i32,
     ) -> Result<NetStream, std::io::Error> {
         use tokio::net::lookup_host;
 
         info!("connecting to MTProxy at {}:{}", host, port);
 
-        // Try to resolve the hostname
         let addrs = lookup_host((host, port)).await.map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -69,7 +140,6 @@ impl NetStream {
             )
         })?;
 
-        // Use the first resolved address
         let addr = addrs.into_iter().next().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -77,7 +147,29 @@ impl NetStream {
             )
         })?;
 
-        Ok(NetStream::MtProxy(TcpStream::connect(addr).await?))
+        let tcp = TcpStream::connect(addr).await?;
+
+        // Parse secret to determine mode
+        let parsed = grammers_mtproto::transport::parse_secret(secret)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        match parsed {
+            grammers_mtproto::transport::ProxySecret::Faketls { key, domain } => {
+                info!("FakeTLS mode: connecting to {} with domain {}", host, domain);
+                let faketls = grammers_mtproto::tls::FakeTlsStream::new(
+                    tcp,
+                    &key,
+                    dc_id as i16,
+                    &domain,
+                )
+                .await?;
+                Ok(NetStream::MtProxyFakeTls(faketls))
+            }
+            _ => {
+                // Simple or Secured — use raw TcpStream (MtProxy transport handles obfuscation)
+                Ok(NetStream::MtProxy(tcp))
+            }
+        }
     }
 
     #[cfg(feature = "proxy")]

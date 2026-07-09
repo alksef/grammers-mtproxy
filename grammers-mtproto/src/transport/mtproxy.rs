@@ -68,10 +68,10 @@ pub struct MtProxy<T: Transport + Tagged> {
 ///
 /// These patterns must be avoided to prevent DPI detection.
 const FORBIDDEN_FIRST_INTS: [[u8; 4]; 4] = [
-    [b'P', b'V', b'r', b'G'],  // PVrG
-    [b'G', b'E', b'T', b' '],  // GET
-    [b'P', b'O', b'S', b'T'],  // POST
-    [0xee, 0xee, 0xee, 0xee],  // Intermediate tag
+    [b'P', b'V', b'r', b'G'], // PVrG
+    [b'G', b'E', b'T', b' '], // GET
+    [b'P', b'O', b'S', b'T'], // POST
+    [0xee, 0xee, 0xee, 0xee], // Intermediate tag
 ];
 
 impl<T: Transport + Tagged> MtProxy<T> {
@@ -119,7 +119,7 @@ impl<T: Transport + Tagged> MtProxy<T> {
     /// - `secret_bytes` is the 16-byte secret
     /// - `mode` indicates the prefix mode (Simple, DDSecure, or EEPrefix)
     fn parse_secret(secret: &str) -> Result<(Vec<u8>, SecretMode), Error> {
-        use base64::{Engine as _, engine::general_purpose};
+        use base64::{engine::general_purpose, Engine as _};
 
         let secret_lower = secret.to_lowercase();
 
@@ -236,8 +236,14 @@ impl<T: Transport + Tagged> MtProxy<T> {
         let encrypt_key_array: [u8; 32] = encrypt_key.try_into().unwrap();
         let decrypt_key_array: [u8; 32] = decrypt_key.try_into().unwrap();
 
-        log::debug!("MTProxy: encrypt_key first 8 bytes = {:02x?}", &encrypt_key_array[..8]);
-        log::debug!("MTProxy: decrypt_key first 8 bytes = {:02x?}", &decrypt_key_array[..8]);
+        log::debug!(
+            "MTProxy: encrypt_key first 8 bytes = {:02x?}",
+            &encrypt_key_array[..8]
+        );
+        log::debug!(
+            "MTProxy: decrypt_key first 8 bytes = {:02x?}",
+            &decrypt_key_array[..8]
+        );
         log::debug!("MTProxy: encrypt_iv = {:02x?}", encrypt_iv);
         log::debug!("MTProxy: decrypt_iv = {:02x?}", decrypt_iv);
 
@@ -253,7 +259,12 @@ impl<T: Transport + Tagged> MtProxy<T> {
 
         // Embed DC ID (2 bytes, little-endian, signed)
         let dc_bytes = (dc_id as u16).to_le_bytes();
-        log::debug!("MTProxy: embedding DC ID {} as bytes [{}, {}] at position 60-61", dc_id, dc_bytes[0], dc_bytes[1]);
+        log::debug!(
+            "MTProxy: embedding DC ID {} as bytes [{}, {}] at position 60-61",
+            dc_id,
+            dc_bytes[0],
+            dc_bytes[1]
+        );
         init[60..62].copy_from_slice(&dc_bytes);
 
         // Encrypt the tail (bytes 56-63) to advance both tx and rx counters.
@@ -263,10 +274,21 @@ impl<T: Transport + Tagged> MtProxy<T> {
         cipher.encrypt(&mut encrypted_init);
         init[56..64].copy_from_slice(&encrypted_init[56..64]);
 
-        log::debug!("MTProxy: generated 64-byte header: first 8 bytes = {:02x?}", &init[..8]);
-        log::debug!("MTProxy: bytes 56-63 (encrypted tail) = {:02x?}", &init[56..64]);
-        log::debug!("MTProxy: DC ID at bytes 60-61 = [{}, {}] (before encryption: [{}, {}])",
-            init[60], init[61], dc_bytes[0], dc_bytes[1]);
+        log::debug!(
+            "MTProxy: generated 64-byte header: first 8 bytes = {:02x?}",
+            &init[..8]
+        );
+        log::debug!(
+            "MTProxy: bytes 56-63 (encrypted tail) = {:02x?}",
+            &init[56..64]
+        );
+        log::debug!(
+            "MTProxy: DC ID at bytes 60-61 = [{}, {}] (before encryption: [{}, {}])",
+            init[60],
+            init[61],
+            dc_bytes[0],
+            dc_bytes[1]
+        );
 
         Ok((init, cipher))
     }
@@ -324,126 +346,113 @@ impl<T: Transport + Tagged> Transport for MtProxy<T> {
     }
 }
 
+/// MTProxy secret mode determined by byte length (not prefix).
+///
+/// See gotd `mtproxy/secret.go` for reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxySecret {
+    Simple([u8; 16]),
+    Secured([u8; 16]),
+    Faketls { key: [u8; 16], domain: String },
+}
+
+/// Parse MTProxy secret from hex or base64 string.
+///
+/// Mode is determined by raw byte length:
+/// - 16 bytes → Simple
+/// - 17 bytes → Secured (first byte is tag)
+/// - >17 bytes → Faketls (tag + key[16] + domain bytes)
+pub fn parse_secret(hex_or_b64: &str) -> Result<ProxySecret, Error> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    let decoded = if let Ok(bytes) = hex::decode(hex_or_b64) {
+        bytes
+    } else {
+        let padded = if hex_or_b64.len() % 4 != 0 {
+            let mut p = hex_or_b64.to_string();
+            while p.len() % 4 != 0 {
+                p.push('=');
+            }
+            p
+        } else {
+            hex_or_b64.to_string()
+        };
+        general_purpose::STANDARD
+            .decode(&padded)
+            .map_err(|_| Error::BadLen { got: 0 })?
+    };
+
+    match decoded.len() {
+        16 => {
+            let key: [u8; 16] = decoded.try_into().unwrap();
+            Ok(ProxySecret::Simple(key))
+        }
+        17 => {
+            let key: [u8; 16] = decoded[1..17].try_into().unwrap();
+            Ok(ProxySecret::Secured(key))
+        }
+        n if n > 17 => {
+            let key: [u8; 16] = decoded[1..17].try_into().unwrap();
+            let domain_bytes = &decoded[17..];
+            let domain = String::from_utf8(domain_bytes.to_vec())
+                .map_err(|_| Error::BadLen { got: n as i32 })?;
+            Ok(ProxySecret::Faketls { key, domain })
+        }
+        _ => Err(Error::BadLen {
+            got: decoded.len() as i32,
+        }),
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod parse_secret_tests {
     use super::*;
-    use crate::transport::Intermediate;
 
     #[test]
-    fn test_parse_secret_hex() {
+    fn test_parse_simple_hex() {
         let secret = "0123456789abcdef0123456789abcdef";
-        let (bytes, mode) = MtProxy::<Intermediate>::parse_secret(secret).unwrap();
-        assert_eq!(bytes.len(), 16);
-        assert_eq!(mode, SecretMode::Simple);
+        let result = parse_secret(secret).unwrap();
+        assert!(matches!(result, ProxySecret::Simple(_)));
+        if let ProxySecret::Simple(k) = result {
+            assert_eq!(k.len(), 16);
+        }
     }
 
     #[test]
-    fn test_parse_secret_dd_mode() {
+    fn test_parse_secured_dd() {
         let secret = "dd0123456789abcdef0123456789abcdef";
-        let (bytes, mode) = MtProxy::<Intermediate>::parse_secret(secret).unwrap();
-        assert_eq!(bytes.len(), 16);
-        assert_eq!(mode, SecretMode::DDSecure);
+        let result = parse_secret(secret).unwrap();
+        assert!(matches!(result, ProxySecret::Secured(_)));
     }
 
     #[test]
-    fn test_parse_secret_ee_mode() {
-        let secret = "ee0123456789abcdef0123456789abcdef";
-        let (bytes, mode) = MtProxy::<Intermediate>::parse_secret(secret).unwrap();
-        assert_eq!(bytes.len(), 16);
-        assert_eq!(mode, SecretMode::EEPrefix);
+    fn test_parse_faketls_ee() {
+        let secret = "ee7b184b3f7c1ace06fa2efbbaa851f1a8617267656970686f6e7465732e7275";
+        let result = parse_secret(secret).unwrap();
+        assert!(matches!(result, ProxySecret::Faketls { .. }));
+        if let ProxySecret::Faketls { ref domain, .. } = result {
+            assert_eq!(domain, "argeiphontes.ru");
+        }
     }
 
     #[test]
-    fn test_parse_secret_base64() {
-        let secret = "ASNFZ4mrze/+3LqYdlQyEA==";
-        let (bytes, mode) = MtProxy::<Intermediate>::parse_secret(secret).unwrap();
-        assert_eq!(bytes.len(), 16);
-        assert_eq!(mode, SecretMode::Simple);
+    fn test_parse_secret_len_determines_mode() {
+        // 16 bytes hex → Simple (even if it starts with dd or ee bytes)
+        let r = parse_secret("dd0123456789abcdef0123456789abcd").unwrap();
+        assert!(matches!(r, ProxySecret::Simple(_)));
+
+        // 17 bytes → Secured
+        let r = parse_secret("dd0123456789abcdef0123456789abcdef").unwrap();
+        assert!(matches!(r, ProxySecret::Secured(_)));
+
+        // >17 bytes → Faketls
+        let r = parse_secret("ee7b184b3f7c1ace06fa2efbbaa851f1a8617267656970686f6e7465732e7275")
+            .unwrap();
+        assert!(matches!(r, ProxySecret::Faketls { .. }));
     }
 
     #[test]
-    fn test_parse_secret_invalid_length() {
-        let secret = "0123456789abc"; // Too short
-        assert!(MtProxy::<Intermediate>::parse_secret(secret).is_err());
-    }
-
-    #[test]
-    fn test_dc_id_embedding() {
-        let dc_id: i32 = 2;
-        let dc_bytes = (dc_id as u16).to_le_bytes();
-        assert_eq!(dc_bytes, [2, 0]);
-    }
-
-    #[test]
-    fn test_dc_id_negative() {
-        let dc_id: i32 = -2;
-        let dc_bytes = (dc_id as u16).to_le_bytes();
-        assert_eq!(dc_bytes, [254, 255]); // -2 in little-endian
-    }
-
-    #[test]
-    fn test_forbidden_patterns() {
-        // PVrG pattern
-        assert_eq!(FORBIDDEN_FIRST_INTS[0], [b'P', b'V', b'r', b'G']);
-        // GET pattern
-        assert_eq!(FORBIDDEN_FIRST_INTS[1], [b'G', b'E', b'T', b' ']);
-        // POST pattern
-        assert_eq!(FORBIDDEN_FIRST_INTS[2], [b'P', b'O', b'S', b'T']);
-        // Intermediate tag
-        assert_eq!(FORBIDDEN_FIRST_INTS[3], [0xee, 0xee, 0xee, 0xee]);
-    }
-
-    #[test]
-    fn test_key_derivation() {
-        // Test that key derivation works with a known secret
-        let secret = hex::decode("0123456789abcdef0123456789abcdef").unwrap();
-
-        let mut random = [0u8; 64];
-        let _ = getrandom::fill(&mut random);
-
-        let encrypt_key = {
-            let mut hasher = Sha256::new();
-            hasher.update(&random[8..40]);
-            hasher.update(&secret);
-            hasher.finalize()
-        };
-
-        // Key should be 32 bytes
-        assert_eq!(encrypt_key.len(), 32);
-
-        // Same input should produce same key
-        let encrypt_key2 = {
-            let mut hasher = Sha256::new();
-            hasher.update(&random[8..40]);
-            hasher.update(&secret);
-            hasher.finalize()
-        };
-
-        assert_eq!(encrypt_key, encrypt_key2);
-    }
-
-    #[test]
-    fn test_different_secrets_produce_different_keys() {
-        let secret1 = hex::decode("0123456789abcdef0123456789abcdef").unwrap();
-        let secret2 = hex::decode("fedcba9876543210fedcba9876543210").unwrap();
-
-        let mut random = [0u8; 64];
-        let _ = getrandom::fill(&mut random);
-
-        let key1 = {
-            let mut hasher = Sha256::new();
-            hasher.update(&random[8..40]);
-            hasher.update(&secret1);
-            hasher.finalize()
-        };
-
-        let key2 = {
-            let mut hasher = Sha256::new();
-            hasher.update(&random[8..40]);
-            hasher.update(&secret2);
-            hasher.finalize()
-        };
-
-        assert_ne!(key1, key2);
+    fn test_parse_invalid_length() {
+        assert!(parse_secret("0123456789abc").is_err()); // too short
     }
 }

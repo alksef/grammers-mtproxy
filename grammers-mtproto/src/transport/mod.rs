@@ -26,7 +26,7 @@ pub use abridged::Abridged;
 pub use full::Full;
 use grammers_crypto::DequeBuffer;
 pub use intermediate::Intermediate;
-pub use mtproxy::{MtProxy, SecretMode, with_auto_transport};
+pub use mtproxy::{parse_secret, with_auto_transport, MtProxy, ProxySecret, SecretMode};
 pub use obfuscated::Obfuscated;
 pub use randomized_intermediate::RandomizedIntermediate;
 

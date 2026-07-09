@@ -62,7 +62,11 @@ impl Transport for RandomizedIntermediate {
         let len = buffer.len();
         assert_eq!(len % 4, 0);
 
-        log::debug!("RandomizedIntermediate::pack: initial buffer len = {}, init = {}", len, self.init);
+        log::debug!(
+            "RandomizedIntermediate::pack: initial buffer len = {}, init = {}",
+            len,
+            self.init
+        );
 
         // TDlib-style padding:
         // 1. Read 4 random bytes (we'll use 0-3 of them based on last payload byte)
@@ -81,27 +85,48 @@ impl Transport for RandomizedIntermediate {
         buffer.extend_front(&(total_len as i32).to_le_bytes());
 
         if !self.init {
-            log::debug!("RandomizedIntermediate::pack: adding TAG ({:02x} {:02x} {:02x} {:02x})", Self::TAG[0], Self::TAG[1], Self::TAG[2], Self::TAG[3]);
+            log::debug!(
+                "RandomizedIntermediate::pack: adding TAG ({:02x} {:02x} {:02x} {:02x})",
+                Self::TAG[0],
+                Self::TAG[1],
+                Self::TAG[2],
+                Self::TAG[3]
+            );
             buffer.extend_front(&Self::TAG);
             self.init = true;
         } else {
             log::debug!("RandomizedIntermediate::pack: NOT adding TAG (already initialized)");
         }
 
-        log::debug!("RandomizedIntermediate::pack: final buffer len = {}", buffer.len());
+        log::debug!(
+            "RandomizedIntermediate::pack: final buffer len = {}",
+            buffer.len()
+        );
     }
 
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
         if buffer.len() < 4 {
-            log::debug!("RandomizedIntermediate::unpack: buffer too small ({} < 4)", buffer.len());
+            log::debug!(
+                "RandomizedIntermediate::unpack: buffer too small ({} < 4)",
+                buffer.len()
+            );
             return Err(Error::MissingBytes);
         }
 
         let len = i32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
-        log::debug!("RandomizedIntermediate::unpack: len = {} from bytes {:02x?}, buffer.len() = {}", len, &buffer[0..4], buffer.len());
+        log::debug!(
+            "RandomizedIntermediate::unpack: len = {} from bytes {:02x?}, buffer.len() = {}",
+            len,
+            &buffer[0..4],
+            buffer.len()
+        );
 
         if buffer.len() < 4 + len {
-            log::debug!("RandomizedIntermediate::unpack: MissingBytes (buffer.len() {} < {})", buffer.len(), 4 + len);
+            log::debug!(
+                "RandomizedIntermediate::unpack: MissingBytes (buffer.len() {} < {})",
+                buffer.len(),
+                4 + len
+            );
             return Err(Error::MissingBytes);
         }
 
@@ -120,7 +145,12 @@ impl Transport for RandomizedIntermediate {
         let pad_size = len % 4;
         let data_end = 4 + len - pad_size;
 
-        log::debug!("RandomizedIntermediate::unpack: len={}, pad_size={}, data_end={}", len, pad_size, data_end);
+        log::debug!(
+            "RandomizedIntermediate::unpack: len={}, pad_size={}, data_end={}",
+            len,
+            pad_size,
+            data_end
+        );
 
         Ok(UnpackedOffset {
             data_range: 4..data_end,
@@ -242,7 +272,11 @@ mod tests {
             transport.pack(&mut buffer);
 
             // Skip TAG if present (first 4 bytes), then read length header
-            let offset = if buffer.len() > 8 && buffer[0..4] == RandomizedIntermediate::TAG { 4 } else { 0 };
+            let offset = if buffer.len() > 8 && buffer[0..4] == RandomizedIntermediate::TAG {
+                4
+            } else {
+                0
+            };
             let len_bytes: [u8; 4] = buffer[offset..offset + 4].try_into().unwrap();
             let len = i32::from_le_bytes(len_bytes) as usize;
 
